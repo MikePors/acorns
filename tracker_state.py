@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path.home() / ".claude-tracker" / "tracker.db"
+# Allow tests (and advanced users) to redirect the DB via env var.
+DB_PATH = Path(os.environ.get("TRACKER_DB", str(Path.home() / ".claude-tracker" / "tracker.db")))
+
 HISTORY_LIMIT = 100
 MAX_NAME_LEN = 256
 MAX_PROJECT_LEN = 512
 MAX_NOTES_LEN = 1024
 
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -28,7 +33,7 @@ def _fmt_seconds(s: int) -> str:
         return f"{s // 86400}d{(s % 86400) // 3600}h"
 
 
-def _age(iso: str | None) -> str:
+def age(iso: str | None) -> str:
     if not iso:
         return ""
     try:
@@ -40,7 +45,7 @@ def _age(iso: str | None) -> str:
         return "?"
 
 
-def _duration_between(a_iso: str | None, b_iso: str | None) -> str:
+def duration_between(a_iso: str | None, b_iso: str | None) -> str:
     if not a_iso or not b_iso:
         return "?"
     try:
@@ -55,14 +60,31 @@ def _duration_between(a_iso: str | None, b_iso: str | None) -> str:
         return "?"
 
 
+def _validate(name: str = "", project: str = "", notes: str = "") -> None:
+    if len(name) > MAX_NAME_LEN:
+        raise ValueError(f"name exceeds {MAX_NAME_LEN} characters")
+    if len(project) > MAX_PROJECT_LEN:
+        raise ValueError(f"project exceeds {MAX_PROJECT_LEN} characters")
+    if len(notes) > MAX_NOTES_LEN:
+        raise ValueError(f"notes exceeds {MAX_NOTES_LEN} characters")
+
+
+# ── Database ───────────────────────────────────────────────────────────────────
+
 @contextmanager
 def _db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     DB_PATH.parent.chmod(0o700)
-    con = sqlite3.connect(str(DB_PATH), timeout=10)
+    # Restrict file mode at creation time by narrowing the umask.
+    old_umask = os.umask(0o077)
+    try:
+        con = sqlite3.connect(str(DB_PATH), timeout=10)
+    finally:
+        os.umask(old_umask)
+    # Correct permissions on pre-existing files created under a loose umask.
     DB_PATH.chmod(0o600)
     con.execute("PRAGMA journal_mode=WAL")
-    # executescript always commits first, safe to use for DDL init
+    # executescript always commits first; safe to use for DDL init.
     con.executescript("""
         CREATE TABLE IF NOT EXISTS instances (
             name            TEXT PRIMARY KEY,
@@ -72,13 +94,16 @@ def _db():
         );
         CREATE TABLE IF NOT EXISTS history (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            instance_name TEXT NOT NULL,
+            instance_name TEXT NOT NULL
+                          REFERENCES instances(name) ON DELETE CASCADE,
             project       TEXT NOT NULL,
             notes         TEXT NOT NULL DEFAULT '',
             assigned_at   TEXT,
             completed_at  TEXT
         );
     """)
+    # Must be set per-connection after DDL so FK enforcement is active for DML.
+    con.execute("PRAGMA foreign_keys=ON")
     try:
         yield con
         con.commit()
@@ -96,6 +121,8 @@ def _trim_history(con: sqlite3.Connection, name: str) -> None:
         (name, name, HISTORY_LIMIT),
     )
 
+
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 def load() -> dict:
     with _db() as con:
@@ -127,6 +154,7 @@ def load() -> dict:
 
 def add(name: str) -> bool:
     """Register a new instance. Returns False if it already exists."""
+    _validate(name=name)
     with _db() as con:
         try:
             con.execute("INSERT INTO instances (name) VALUES (?)", (name,))
@@ -137,10 +165,12 @@ def add(name: str) -> bool:
 
 def remove(name: str) -> bool:
     """Remove an instance and its full history. Returns False if not found."""
+    _validate(name=name)
     with _db() as con:
         cur = con.execute("DELETE FROM instances WHERE name = ?", (name,))
         if cur.rowcount == 0:
             return False
+        # Belt-and-suspenders: manual delete handles DBs that pre-date the FK constraint.
         con.execute("DELETE FROM history WHERE instance_name = ?", (name,))
         return True
 
@@ -153,7 +183,10 @@ def exists(name: str) -> bool:
         )
 
 
-def assign(name: str, project: str, notes: str = "") -> None:
+def assign(name: str, project: str, notes: str = "") -> bool:
+    """Assign project to instance. Creates the instance if it doesn't exist.
+    Returns True if the instance was newly created, False if it already existed."""
+    _validate(name=name, project=project, notes=notes)
     with _db() as con:
         row = con.execute(
             "SELECT current_project, notes, assigned_at FROM instances WHERE name = ?",
@@ -165,7 +198,7 @@ def assign(name: str, project: str, notes: str = "") -> None:
                 "VALUES (?, ?, ?, ?)",
                 (name, project, notes, _now()),
             )
-            return
+            return True
         if row[0]:
             con.execute(
                 "INSERT INTO history "
@@ -179,9 +212,12 @@ def assign(name: str, project: str, notes: str = "") -> None:
             "WHERE name = ?",
             (project, notes, _now(), name),
         )
+        return False
 
 
 def done(name: str) -> bool:
+    """Mark active project done. Returns False if instance is idle or not found."""
+    _validate(name=name)
     with _db() as con:
         row = con.execute(
             "SELECT current_project, notes, assigned_at FROM instances WHERE name = ?",

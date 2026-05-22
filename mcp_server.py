@@ -143,7 +143,7 @@ def handle_status(_args: dict) -> str:
     lines.append("-" * 72)
     for name, data in instances.items():
         project = data.get("current_project") or "idle"
-        since = tracker_state._age(data.get("assigned_at")) if data.get("current_project") else ""
+        since = tracker_state.age(data.get("assigned_at")) if data.get("current_project") else ""
         notes = data.get("notes", "")
         lines.append(f"{name:<20} {project:<30} {since:<8} {notes}")
     return "\n".join(lines)

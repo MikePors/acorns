@@ -81,7 +81,7 @@ InstanceCard:focus {
     color: $accent;
 }
 
-AddModal, EditModal, HistoryModal {
+AddModal, EditModal, HistoryModal, ConfirmModal {
     align: center middle;
 }
 
@@ -143,16 +143,16 @@ def _card_markup(name: str, data: dict) -> str:
     if project:
         parts.append(f"[green]📁 {escape(project)}[/green]")
         if assigned_at:
-            age = tracker_state._age(assigned_at)
+            a = tracker_state.age(assigned_at)
             try:
                 t = datetime.fromisoformat(assigned_at)
                 if t.tzinfo is None:
                     t = t.replace(tzinfo=timezone.utc)
                 is_overdue = (datetime.now(timezone.utc) - t) > timedelta(hours=8)
                 color = "yellow" if is_overdue else "dim"
-                parts.append(f"[{color}]⏱  {age}[/{color}]")
+                parts.append(f"[{color}]⏱  {a}[/{color}]")
             except Exception:
-                parts.append(f"[dim]⏱  {age}[/dim]")
+                parts.append(f"[dim]⏱  {a}[/dim]")
         if notes:
             parts += ["", f"[dim italic]{escape(notes)}[/dim italic]"]
     else:
@@ -304,7 +304,7 @@ class HistoryModal(ModalScreen):
                         a = entry.get("assigned_at")
                         c = entry.get("completed_at")
                         notes = entry.get("notes", "")
-                        dur = tracker_state._duration_between(a, c)
+                        dur = tracker_state.duration_between(a, c)
                         try:
                             ts = datetime.fromisoformat(a)
                             date_str = ts.strftime("%b %d")
@@ -320,6 +320,33 @@ class HistoryModal(ModalScreen):
     @on(Button.Pressed, "#close")
     def do_close(self) -> None:
         self.dismiss()
+
+
+class ConfirmModal(ModalScreen):
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, message: str, **kwargs):
+        super().__init__(**kwargs)
+        self._message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label("Confirm", classes="dialog-title")
+            yield Label(self._message)
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Yes, remove", variant="error", id="yes")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#cancel", Button).focus()
+
+    @on(Button.Pressed, "#yes")
+    def do_yes(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel")
+    def do_cancel(self) -> None:
+        self.dismiss(False)
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -364,23 +391,45 @@ class TrackerApp(App):
         f = self.focused
         return f if isinstance(f, InstanceCard) else None
 
-    def _rebuild(self) -> None:
+    def _rebuild(self, *, prefer: str | None = None) -> None:
+        """Rebuild card row. Restores focus to `prefer` (or the previously focused card)."""
+        target = prefer
+        if target is None:
+            card = self._focused_card()
+            if card:
+                target = card.instance_name
+
         row = self.query_one("#cards-row")
         row.remove_children()
         state = tracker_state.load()
         for name, data in state.get("instances", {}).items():
             row.mount(InstanceCard(name, data, id=_safe_id(name)))
         row.mount(Static("[ + ]\n\npress n", classes="add-card", id="add-ph"))
-        self.call_after_refresh(self._focus_first)
+
+        def _restore() -> None:
+            if target is not None:
+                try:
+                    self.query_one(f"#{_safe_id(target)}", InstanceCard).focus()
+                    return
+                except Exception:
+                    pass
+            self._focus_first()
+
+        self.call_after_refresh(_restore)
 
     def action_new_instance(self) -> None:
         def cb(name: str | None) -> None:
             if not name:
                 return
-            if not tracker_state.add(name):
+            try:
+                added = tracker_state.add(name)
+            except ValueError as e:
+                self.notify(str(e), severity="error")
+                return
+            if not added:
                 self.notify(f"'{name}' already exists", severity="warning")
                 return
-            self._rebuild()
+            self._rebuild(prefer=name)
             self.notify(f"Added: {name}")
 
         self.push_screen(AddModal(), cb)
@@ -392,19 +441,23 @@ class TrackerApp(App):
             return
         state = tracker_state.load()
         data = state["instances"].get(card.instance_name, {})
+        name = card.instance_name
 
         def cb(result: dict | None) -> None:
             if result is None:
                 return
-            if result["action"] == "assign":
-                tracker_state.assign(card.instance_name, result["project"], result["notes"])
-                self.notify(f"{card.instance_name} → {result['project']}")
-            elif result["action"] == "done":
-                if tracker_state.done(card.instance_name):
-                    self.notify(f"{card.instance_name} ✓ done")
-            self._rebuild()
+            try:
+                if result["action"] == "assign":
+                    tracker_state.assign(name, result["project"], result["notes"])
+                    self.notify(f"{name} → {result['project']}")
+                elif result["action"] == "done":
+                    if tracker_state.done(name):
+                        self.notify(f"{name} ✓ done")
+            except ValueError as e:
+                self.notify(str(e), severity="error")
+            self._rebuild(prefer=name)
 
-        self.push_screen(EditModal(card.instance_name, data), cb)
+        self.push_screen(EditModal(name, data), cb)
 
     def action_mark_done(self) -> None:
         card = self._focused_card()
@@ -413,9 +466,10 @@ class TrackerApp(App):
         if not card.instance_data.get("current_project"):
             self.notify("No active project", severity="warning")
             return
-        tracker_state.done(card.instance_name)
-        self._rebuild()
-        self.notify(f"{card.instance_name} ✓ done")
+        name = card.instance_name
+        tracker_state.done(name)
+        self._rebuild(prefer=name)
+        self.notify(f"{name} ✓ done")
 
     def action_history(self) -> None:
         card = self._focused_card()
@@ -430,9 +484,16 @@ class TrackerApp(App):
         card = self._focused_card()
         if card is None:
             return
-        tracker_state.remove(card.instance_name)
-        self._rebuild()
-        self.notify(f"Removed: {card.instance_name}", severity="warning")
+        name = card.instance_name
+
+        def cb(confirmed: bool | None) -> None:
+            if not confirmed:
+                return
+            tracker_state.remove(name)
+            self._rebuild()
+            self.notify(f"Removed: {name}", severity="warning")
+
+        self.push_screen(ConfirmModal(f"Remove '{name}' and all history?"), cb)
 
     def action_reload(self) -> None:
         self._rebuild()
@@ -479,7 +540,7 @@ def cmd_status() -> None:
         assigned_at = data.get("assigned_at")
         notes = data.get("notes", "")
         if project:
-            table.add_row(name, f"[green]{project}[/]", tracker_state._age(assigned_at), notes)
+            table.add_row(name, f"[green]{project}[/]", tracker_state.age(assigned_at), notes)
         else:
             table.add_row(name, "[dim]idle[/]", "", "")
     console.print(table)
@@ -488,7 +549,12 @@ def cmd_status() -> None:
 @cli.command("add")
 def cmd_add(name: str = typer.Argument(..., help="Instance or character name")) -> None:
     """Add a new instance."""
-    if not tracker_state.add(name):
+    try:
+        added = tracker_state.add(name)
+    except ValueError as e:
+        console.print(f"[red]Error:[/] {e}")
+        raise typer.Exit(1)
+    if not added:
         console.print(f"[yellow]'{name}' already exists[/]")
         raise typer.Exit(1)
     console.print(f"[green]✓[/] Added: {name}")
@@ -501,8 +567,11 @@ def cmd_assign(
     notes: str = typer.Option("", "--notes", "-n", help="Optional context"),
 ) -> None:
     """Assign a project to an instance."""
-    created = not tracker_state.exists(name)
-    tracker_state.assign(name, project, notes)
+    try:
+        created = tracker_state.assign(name, project, notes)
+    except ValueError as e:
+        console.print(f"[red]Error:[/] {e}")
+        raise typer.Exit(1)
     if created:
         console.print(f"[dim]Note: created new instance '{name}'[/]")
     console.print(f"[green]✓[/] {name} → {project}")
