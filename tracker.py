@@ -13,11 +13,10 @@ Usage:
 """
 from __future__ import annotations
 
-import json
-import sys
+import hashlib
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
+import tracker_state
 import typer
 from rich.console import Console
 from rich.markup import escape
@@ -28,102 +27,6 @@ from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, Static
-
-# ── Storage ────────────────────────────────────────────────────────────────────
-
-STATE_PATH = Path.home() / ".claude-tracker" / "state.json"
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _age(iso: str | None) -> str:
-    if not iso:
-        return ""
-    try:
-        t = datetime.fromisoformat(iso)
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        s = int((datetime.now(timezone.utc) - t).total_seconds())
-        if s < 60:
-            return f"{s}s"
-        elif s < 3600:
-            return f"{s // 60}m"
-        elif s < 86400:
-            return f"{s // 3600}h{(s % 3600) // 60:02d}m"
-        else:
-            return f"{s // 86400}d{(s % 86400) // 3600}h"
-    except Exception:
-        return "?"
-
-
-def _duration_between(a_iso: str | None, b_iso: str | None) -> str:
-    if not a_iso or not b_iso:
-        return "?"
-    try:
-        a = datetime.fromisoformat(a_iso)
-        b = datetime.fromisoformat(b_iso)
-        if a.tzinfo is None:
-            a = a.replace(tzinfo=timezone.utc)
-        if b.tzinfo is None:
-            b = b.replace(tzinfo=timezone.utc)
-        s = abs(int((b - a).total_seconds()))
-        if s < 60:
-            return f"{s}s"
-        elif s < 3600:
-            return f"{s // 60}m"
-        elif s < 86400:
-            return f"{s // 3600}h{(s % 3600) // 60:02d}m"
-        else:
-            return f"{s // 86400}d{(s % 86400) // 3600}h"
-    except Exception:
-        return "?"
-
-
-def load() -> dict:
-    if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text())
-        except Exception:
-            pass
-    return {"instances": {}}
-
-
-def save(state: dict) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2))
-
-
-def _assign(state: dict, name: str, project: str, notes: str = "") -> None:
-    inst = state["instances"].setdefault(name, {"history": []})
-    if inst.get("current_project"):
-        inst.setdefault("history", []).append({
-            "project": inst["current_project"],
-            "notes": inst.get("notes", ""),
-            "assigned_at": inst.get("assigned_at"),
-            "completed_at": _now(),
-        })
-    inst["current_project"] = project
-    inst["notes"] = notes
-    inst["assigned_at"] = _now()
-
-
-def _done(state: dict, name: str) -> bool:
-    inst = state["instances"].get(name)
-    if not inst or not inst.get("current_project"):
-        return False
-    inst.setdefault("history", []).append({
-        "project": inst["current_project"],
-        "notes": inst.get("notes", ""),
-        "assigned_at": inst.get("assigned_at"),
-        "completed_at": _now(),
-    })
-    inst["current_project"] = None
-    inst["notes"] = ""
-    inst["assigned_at"] = None
-    return True
-
 
 # ── TUI ────────────────────────────────────────────────────────────────────────
 
@@ -240,7 +143,7 @@ def _card_markup(name: str, data: dict) -> str:
     if project:
         parts.append(f"[green]📁 {escape(project)}[/green]")
         if assigned_at:
-            age = _age(assigned_at)
+            age = tracker_state._age(assigned_at)
             try:
                 t = datetime.fromisoformat(assigned_at)
                 if t.tzinfo is None:
@@ -401,7 +304,7 @@ class HistoryModal(ModalScreen):
                         a = entry.get("assigned_at")
                         c = entry.get("completed_at")
                         notes = entry.get("notes", "")
-                        dur = _duration_between(a, c)
+                        dur = tracker_state._duration_between(a, c)
                         try:
                             ts = datetime.fromisoformat(a)
                             date_str = ts.strftime("%b %d")
@@ -440,7 +343,7 @@ class TrackerApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="cards-row"):
-            state = load()
+            state = tracker_state.load()
             for name, data in state.get("instances", {}).items():
                 yield InstanceCard(name, data, id=_safe_id(name))
             yield Static("[ + ]\n\npress n", classes="add-card", id="add-ph")
@@ -464,7 +367,7 @@ class TrackerApp(App):
     def _rebuild(self) -> None:
         row = self.query_one("#cards-row")
         row.remove_children()
-        state = load()
+        state = tracker_state.load()
         for name, data in state.get("instances", {}).items():
             row.mount(InstanceCard(name, data, id=_safe_id(name)))
         row.mount(Static("[ + ]\n\npress n", classes="add-card", id="add-ph"))
@@ -474,17 +377,9 @@ class TrackerApp(App):
         def cb(name: str | None) -> None:
             if not name:
                 return
-            state = load()
-            if name in state["instances"]:
+            if not tracker_state.add(name):
                 self.notify(f"'{name}' already exists", severity="warning")
                 return
-            state["instances"][name] = {
-                "current_project": None,
-                "notes": "",
-                "assigned_at": None,
-                "history": [],
-            }
-            save(state)
             self._rebuild()
             self.notify(f"Added: {name}")
 
@@ -495,21 +390,18 @@ class TrackerApp(App):
         if card is None:
             self.notify("Select an instance card first", severity="warning")
             return
-        state = load()
+        state = tracker_state.load()
         data = state["instances"].get(card.instance_name, {})
 
         def cb(result: dict | None) -> None:
             if result is None:
                 return
-            s = load()
-            inst = s["instances"].setdefault(card.instance_name, {"history": []})
             if result["action"] == "assign":
-                _assign(s, card.instance_name, result["project"], result["notes"])
+                tracker_state.assign(card.instance_name, result["project"], result["notes"])
                 self.notify(f"{card.instance_name} → {result['project']}")
             elif result["action"] == "done":
-                if _done(s, card.instance_name):
+                if tracker_state.done(card.instance_name):
                     self.notify(f"{card.instance_name} ✓ done")
-            save(s)
             self._rebuild()
 
         self.push_screen(EditModal(card.instance_name, data), cb)
@@ -521,9 +413,7 @@ class TrackerApp(App):
         if not card.instance_data.get("current_project"):
             self.notify("No active project", severity="warning")
             return
-        s = load()
-        _done(s, card.instance_name)
-        save(s)
+        tracker_state.done(card.instance_name)
         self._rebuild()
         self.notify(f"{card.instance_name} ✓ done")
 
@@ -532,7 +422,7 @@ class TrackerApp(App):
         if card is None:
             self.notify("Select an instance card first", severity="warning")
             return
-        state = load()
+        state = tracker_state.load()
         history = state["instances"].get(card.instance_name, {}).get("history", [])
         self.push_screen(HistoryModal(card.instance_name, history))
 
@@ -540,18 +430,12 @@ class TrackerApp(App):
         card = self._focused_card()
         if card is None:
             return
-        s = load()
-        s["instances"].pop(card.instance_name, None)
-        save(s)
+        tracker_state.remove(card.instance_name)
         self._rebuild()
         self.notify(f"Removed: {card.instance_name}", severity="warning")
 
     def action_reload(self) -> None:
-        state = load()
-        for card in self.query(InstanceCard):
-            data = state["instances"].get(card.instance_name)
-            if data:
-                card.reload(data)
+        self._rebuild()
 
     def action_focus_prev(self) -> None:
         self.focus_previous()
@@ -561,7 +445,7 @@ class TrackerApp(App):
 
 
 def _safe_id(name: str) -> str:
-    return "card-" + "".join(c if c.isalnum() else "-" for c in name).lower().strip("-")
+    return "card-" + hashlib.md5(name.encode()).hexdigest()[:12]
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -580,7 +464,7 @@ def main(ctx: typer.Context) -> None:
 @cli.command("status")
 def cmd_status() -> None:
     """Print current assignments as a table."""
-    state = load()
+    state = tracker_state.load()
     instances = state.get("instances", {})
     if not instances:
         console.print("[dim]No instances yet.  Run: tracker add 'Darth Vader'[/]")
@@ -595,7 +479,7 @@ def cmd_status() -> None:
         assigned_at = data.get("assigned_at")
         notes = data.get("notes", "")
         if project:
-            table.add_row(name, f"[green]{project}[/]", _age(assigned_at), notes)
+            table.add_row(name, f"[green]{project}[/]", tracker_state._age(assigned_at), notes)
         else:
             table.add_row(name, "[dim]idle[/]", "", "")
     console.print(table)
@@ -604,14 +488,9 @@ def cmd_status() -> None:
 @cli.command("add")
 def cmd_add(name: str = typer.Argument(..., help="Instance or character name")) -> None:
     """Add a new instance."""
-    state = load()
-    if name in state["instances"]:
+    if not tracker_state.add(name):
         console.print(f"[yellow]'{name}' already exists[/]")
         raise typer.Exit(1)
-    state["instances"][name] = {
-        "current_project": None, "notes": "", "assigned_at": None, "history": [],
-    }
-    save(state)
     console.print(f"[green]✓[/] Added: {name}")
 
 
@@ -622,34 +501,28 @@ def cmd_assign(
     notes: str = typer.Option("", "--notes", "-n", help="Optional context"),
 ) -> None:
     """Assign a project to an instance."""
-    state = load()
-    if name not in state["instances"]:
-        state["instances"][name] = {"history": []}
-    _assign(state, name, project, notes)
-    save(state)
+    created = not tracker_state.exists(name)
+    tracker_state.assign(name, project, notes)
+    if created:
+        console.print(f"[dim]Note: created new instance '{name}'[/]")
     console.print(f"[green]✓[/] {name} → {project}")
 
 
 @cli.command("done")
 def cmd_done(name: str = typer.Argument(..., help="Instance name")) -> None:
     """Mark an instance's current project as done."""
-    state = load()
-    if not _done(state, name):
+    if not tracker_state.done(name):
         console.print(f"[yellow]'{name}' has no active project[/]")
         raise typer.Exit(1)
-    save(state)
     console.print(f"[green]✓[/] {name} marked done")
 
 
 @cli.command("remove")
 def cmd_remove(name: str = typer.Argument(..., help="Instance name")) -> None:
     """Remove an instance entirely."""
-    state = load()
-    if name not in state["instances"]:
+    if not tracker_state.remove(name):
         console.print(f"[yellow]'{name}' not found[/]")
         raise typer.Exit(1)
-    del state["instances"][name]
-    save(state)
     console.print(f"[dim]Removed: {name}[/]")
 
 

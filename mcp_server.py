@@ -9,7 +9,7 @@ Config snippet (~/.claude/settings.json):
   "mcpServers": {
     "tracker": {
       "command": "python3",
-      "args": ["/path/to/tracker/mcp_server.py"]
+      "args": ["/path/to/mcp_server.py"]
     }
   }
 
@@ -23,19 +23,15 @@ from __future__ import annotations
 
 import json
 import sys
-import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 
-# Re-use the same data layer as the TUI app
 sys.path.insert(0, str(Path(__file__).parent))
-from tracker import _age, _assign, _done, _now, load, save
+import tracker_state
 
 # ── MCP JSON-RPC transport ─────────────────────────────────────────────────────
 
 def _send(obj: dict) -> None:
-    line = json.dumps(obj)
-    sys.stdout.write(line + "\n")
+    sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
 
 
@@ -56,11 +52,7 @@ TOOLS = [
             "Get the current assignment status for all tracked Claude instances. "
             "Returns a plain-text table suitable for reading in a conversation."
         ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "tracker_assign",
@@ -75,14 +67,17 @@ TOOLS = [
                 "instance": {
                     "type": "string",
                     "description": "The instance name / character label (e.g. 'Morpheus')",
+                    "maxLength": tracker_state.MAX_NAME_LEN,
                 },
                 "project": {
                     "type": "string",
                     "description": "Short project or task name",
+                    "maxLength": tracker_state.MAX_PROJECT_LEN,
                 },
                 "notes": {
                     "type": "string",
                     "description": "Optional brief context (one line)",
+                    "maxLength": tracker_state.MAX_NOTES_LEN,
                 },
             },
             "required": ["instance", "project"],
@@ -100,6 +95,7 @@ TOOLS = [
                 "instance": {
                     "type": "string",
                     "description": "The instance name / character label",
+                    "maxLength": tracker_state.MAX_NAME_LEN,
                 },
             },
             "required": ["instance"],
@@ -114,6 +110,7 @@ TOOLS = [
                 "instance": {
                     "type": "string",
                     "description": "Instance name or character label",
+                    "maxLength": tracker_state.MAX_NAME_LEN,
                 },
             },
             "required": ["instance"],
@@ -124,8 +121,20 @@ TOOLS = [
 
 # ── Tool handlers ──────────────────────────────────────────────────────────────
 
+def _validate_lengths(**fields: str) -> None:
+    limits = {
+        "instance": tracker_state.MAX_NAME_LEN,
+        "project": tracker_state.MAX_PROJECT_LEN,
+        "notes": tracker_state.MAX_NOTES_LEN,
+    }
+    for field, value in fields.items():
+        limit = limits.get(field, 1024)
+        if len(value) > limit:
+            raise ValueError(f"'{field}' exceeds maximum length of {limit}")
+
+
 def handle_status(_args: dict) -> str:
-    state = load()
+    state = tracker_state.load()
     instances = state.get("instances", {})
     if not instances:
         return "No instances tracked yet."
@@ -134,7 +143,7 @@ def handle_status(_args: dict) -> str:
     lines.append("-" * 72)
     for name, data in instances.items():
         project = data.get("current_project") or "idle"
-        since = _age(data.get("assigned_at")) if data.get("current_project") else ""
+        since = tracker_state._age(data.get("assigned_at")) if data.get("current_project") else ""
         notes = data.get("notes", "")
         lines.append(f"{name:<20} {project:<30} {since:<8} {notes}")
     return "\n".join(lines)
@@ -145,37 +154,29 @@ def handle_assign(args: dict) -> str:
     project = args.get("project", "").strip()
     notes = args.get("notes", "").strip()
     if not name or not project:
-        return "Error: instance and project are required."
-    state = load()
-    if name not in state["instances"]:
-        state["instances"][name] = {"history": []}
-    _assign(state, name, project, notes)
-    save(state)
+        raise ValueError("instance and project are required.")
+    _validate_lengths(instance=name, project=project, notes=notes)
+    tracker_state.assign(name, project, notes)
     return f"✓ {name} → {project}"
 
 
 def handle_done(args: dict) -> str:
     name = args.get("instance", "").strip()
     if not name:
-        return "Error: instance name required."
-    state = load()
-    if _done(state, name):
-        save(state)
+        raise ValueError("instance name required.")
+    _validate_lengths(instance=name)
+    if tracker_state.done(name):
         return f"✓ {name} marked done"
-    return f"'{name}' has no active project."
+    raise ValueError(f"'{name}' has no active project.")
 
 
 def handle_add(args: dict) -> str:
     name = args.get("instance", "").strip()
     if not name:
-        return "Error: instance name required."
-    state = load()
-    if name in state["instances"]:
-        return f"'{name}' already exists."
-    state["instances"][name] = {
-        "current_project": None, "notes": "", "assigned_at": None, "history": [],
-    }
-    save(state)
+        raise ValueError("instance name required.")
+    _validate_lengths(instance=name)
+    if not tracker_state.add(name):
+        raise ValueError(f"'{name}' already exists.")
     return f"✓ Added: {name}"
 
 
@@ -197,6 +198,7 @@ def main() -> None:
         try:
             msg = json.loads(raw_line)
         except json.JSONDecodeError:
+            _error(None, -32700, "Parse error")
             continue
 
         method = msg.get("method", "")
@@ -231,7 +233,7 @@ def main() -> None:
                 })
             except Exception as e:
                 _respond(req_id, {
-                    "content": [{"type": "text", "text": f"Error: {e}"}],
+                    "content": [{"type": "text", "text": str(e)}],
                     "isError": True,
                 })
 
