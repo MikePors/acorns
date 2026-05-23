@@ -13,7 +13,6 @@ Usage:
 """
 from __future__ import annotations
 
-import hashlib
 from datetime import datetime, timezone, timedelta
 
 import tracker_state
@@ -372,8 +371,8 @@ class TrackerApp(App):
         with Horizontal(id="cards-row"):
             state = tracker_state.load()
             for name, data in state.get("instances", {}).items():
-                yield InstanceCard(name, data, id=_safe_id(name))
-            yield Static("[ + ]\n\npress n", classes="add-card", id="add-ph")
+                yield InstanceCard(name, data)
+            yield Static("[ + ]\n\npress n", classes="add-card")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -385,7 +384,7 @@ class TrackerApp(App):
         if cards:
             cards[0].focus()
         else:
-            self.query_one("#add-ph").focus()
+            self.query_one(".add-card").focus()
 
     def _focused_card(self) -> InstanceCard | None:
         f = self.focused
@@ -403,16 +402,15 @@ class TrackerApp(App):
         row.remove_children()
         state = tracker_state.load()
         for name, data in state.get("instances", {}).items():
-            row.mount(InstanceCard(name, data, id=_safe_id(name)))
-        row.mount(Static("[ + ]\n\npress n", classes="add-card", id="add-ph"))
+            row.mount(InstanceCard(name, data))
+        row.mount(Static("[ + ]\n\npress n", classes="add-card"))
 
         def _restore() -> None:
             if target is not None:
-                try:
-                    self.query_one(f"#{_safe_id(target)}", InstanceCard).focus()
-                    return
-                except Exception:
-                    pass
+                for card in self.query(InstanceCard):
+                    if card.instance_name == target:
+                        card.focus()
+                        return
             self._focus_first()
 
         self.call_after_refresh(_restore)
@@ -503,10 +501,6 @@ class TrackerApp(App):
 
     def action_focus_next(self) -> None:
         self.focus_next()
-
-
-def _safe_id(name: str) -> str:
-    return "card-" + hashlib.md5(name.encode()).hexdigest()[:12]
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
