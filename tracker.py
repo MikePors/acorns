@@ -362,7 +362,7 @@ class TrackerApp(App):
         Binding("delete", "remove_instance", "Remove", show=False),
         Binding("r", "reload", "Refresh", show=False),
         Binding("q", "quit", "Quit"),
-        Binding("left", "focus_prev", show=False),
+        Binding("left", "focus_previous", show=False),
         Binding("right", "focus_next", show=False),
     ]
 
@@ -519,11 +519,6 @@ class TrackerApp(App):
     def action_reload(self) -> None:
         self._schedule_rebuild()
 
-    def action_focus_prev(self) -> None:
-        self.focus_previous()
-
-    def action_focus_next(self) -> None:
-        self.focus_next()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
