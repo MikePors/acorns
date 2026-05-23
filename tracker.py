@@ -534,7 +534,7 @@ def cmd_status() -> None:
         assigned_at = data.get("assigned_at")
         notes = data.get("notes", "")
         if project:
-            table.add_row(name, f"[green]{project}[/]", tracker_state.age(assigned_at), notes)
+            table.add_row(name, f"[green]{escape(project)}[/]", tracker_state.age(assigned_at), notes)
         else:
             table.add_row(name, "[dim]idle[/]", "", "")
     console.print(table)
