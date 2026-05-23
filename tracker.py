@@ -394,7 +394,7 @@ class TrackerApp(App):
         Binding("h", "history", "History"),
         Binding("d", "mark_done", "Done"),
         Binding("delete", "remove_instance", "Remove", show=False),
-        Binding("r", "reload", "Refresh", show=False),
+        Binding("r", "reload", "Refresh"),
         Binding("q", "quit", "Quit"),
         Binding("left", "focus_previous", show=False),
         Binding("right", "focus_next", show=False),
