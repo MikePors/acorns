@@ -377,7 +377,7 @@ class TrackerApp(App):
 
     def on_mount(self) -> None:
         self._focus_first()
-        self.set_interval(60, self.action_reload)
+        self.set_interval(60, self._schedule_rebuild)
 
     def _focus_first(self) -> None:
         cards = list(self.query(InstanceCard))
@@ -390,20 +390,41 @@ class TrackerApp(App):
         f = self.focused
         return f if isinstance(f, InstanceCard) else None
 
-    def _rebuild(self, *, prefer: str | None = None) -> None:
-        """Rebuild card row. Restores focus to `prefer` (or the previously focused card)."""
+    def _schedule_rebuild(self, *, prefer: str | None = None) -> None:
+        """Fire-and-forget wrapper: cancels any in-progress rebuild before starting a new one."""
+        self.run_worker(self._rebuild(prefer=prefer), exclusive=True, name="rebuild")
+
+    async def _rebuild(self, *, prefer: str | None = None) -> None:
+        """Rebuild card row with serialised DOM operations and in-place reload where possible."""
         target = prefer
         if target is None:
             card = self._focused_card()
             if card:
                 target = card.instance_name
 
-        row = self.query_one("#cards-row")
-        row.remove_children()
         state = tracker_state.load()
-        for name, data in state.get("instances", {}).items():
-            row.mount(InstanceCard(name, data))
-        row.mount(Static("[ + ]\n\npress n", classes="add-card"))
+        new_instances: dict[str, dict] = state.get("instances", {})
+        row = self.query_one("#cards-row")
+
+        existing: dict[str, InstanceCard] = {
+            c.instance_name: c for c in row.query(InstanceCard)
+        }
+        cards_to_remove = [c for name, c in existing.items() if name not in new_instances]
+        names_to_add = [name for name in new_instances if name not in existing]
+
+        if cards_to_remove or names_to_add:
+            async with row.batch():
+                if cards_to_remove:
+                    await row.remove_children(cards_to_remove)
+                if names_to_add:
+                    new_widgets = [
+                        InstanceCard(name, new_instances[name]) for name in names_to_add
+                    ]
+                    await row.mount(*new_widgets, before=row.query_one(".add-card"))
+
+        for name, card in existing.items():
+            if name in new_instances and card not in cards_to_remove:
+                card.reload(new_instances[name])
 
         def _restore() -> None:
             if target is not None:
@@ -427,7 +448,7 @@ class TrackerApp(App):
             if not added:
                 self.notify(f"'{name}' already exists", severity="warning")
                 return
-            self._rebuild(prefer=name)
+            self._schedule_rebuild(prefer=name)
             self.notify(f"Added: {name}")
 
         self.push_screen(AddModal(), cb)
@@ -453,7 +474,7 @@ class TrackerApp(App):
                         self.notify(f"{name} ✓ done")
             except ValueError as e:
                 self.notify(str(e), severity="error")
-            self._rebuild(prefer=name)
+            self._schedule_rebuild(prefer=name)
 
         self.push_screen(EditModal(name, data), cb)
 
@@ -465,8 +486,10 @@ class TrackerApp(App):
             self.notify("No active project", severity="warning")
             return
         name = card.instance_name
-        tracker_state.done(name)
-        self._rebuild(prefer=name)
+        if not tracker_state.done(name):
+            self.notify("No active project", severity="warning")
+            return
+        self._schedule_rebuild(prefer=name)
         self.notify(f"{name} ✓ done")
 
     def action_history(self) -> None:
@@ -488,13 +511,13 @@ class TrackerApp(App):
             if not confirmed:
                 return
             tracker_state.remove(name)
-            self._rebuild()
+            self._schedule_rebuild()
             self.notify(f"Removed: {name}", severity="warning")
 
         self.push_screen(ConfirmModal(f"Remove '{name}' and all history?"), cb)
 
     def action_reload(self) -> None:
-        self._rebuild()
+        self._schedule_rebuild()
 
     def action_focus_prev(self) -> None:
         self.focus_previous()
