@@ -29,9 +29,7 @@ class TestAdd:
     def test_new_instance_is_idle(self):
         tracker_state.add("Alice")
         inst = tracker_state.load()["instances"]["Alice"]
-        assert inst["current_project"] is None
-        assert inst["notes"] == ""
-        assert inst["assigned_at"] is None
+        assert inst["active"] == []
         assert inst["history"] == []
 
     def test_name_too_long_raises(self):
@@ -73,7 +71,8 @@ class TestRemove:
     def test_history_purged_on_remove(self):
         tracker_state.add("Dave")
         tracker_state.assign("Dave", "Project A")
-        tracker_state.done("Dave")
+        pid = tracker_state.load()["instances"]["Dave"]["active"][0]["id"]
+        tracker_state.done("Dave", pid)
         tracker_state.remove("Dave")
         # Re-add to confirm no orphan history rows survive.
         tracker_state.add("Dave")
@@ -92,22 +91,24 @@ class TestAssign:
         tracker_state.add("Frank")
         assert tracker_state.assign("Frank", "Project Y") is False
 
-    def test_sets_current_project(self):
+    def test_adds_to_active(self):
         tracker_state.add("Grace")
         tracker_state.assign("Grace", "Project A", "some notes")
         inst = tracker_state.load()["instances"]["Grace"]
-        assert inst["current_project"] == "Project A"
-        assert inst["notes"] == "some notes"
-        assert inst["assigned_at"] is not None
+        assert len(inst["active"]) == 1
+        assert inst["active"][0]["project"] == "Project A"
+        assert inst["active"][0]["notes"] == "some notes"
+        assert inst["active"][0]["assigned_at"] is not None
 
-    def test_previous_project_moves_to_history(self):
+    def test_multiple_projects_stack(self):
         tracker_state.add("Hank")
         tracker_state.assign("Hank", "Project A")
         tracker_state.assign("Hank", "Project B")
         inst = tracker_state.load()["instances"]["Hank"]
-        assert inst["current_project"] == "Project B"
-        assert len(inst["history"]) == 1
-        assert inst["history"][0]["project"] == "Project A"
+        projects = [e["project"] for e in inst["active"]]
+        assert "Project A" in projects
+        assert "Project B" in projects
+        assert inst["history"] == []
 
     def test_name_too_long_raises(self):
         with pytest.raises(ValueError, match="name"):
@@ -130,7 +131,13 @@ class TestDone:
     def test_returns_true_when_active(self):
         tracker_state.add("Kate")
         tracker_state.assign("Kate", "Project A")
-        assert tracker_state.done("Kate") is True
+        pid = tracker_state.load()["instances"]["Kate"]["active"][0]["id"]
+        assert tracker_state.done("Kate", pid) is True
+
+    def test_returns_true_without_project_id(self):
+        tracker_state.add("Kate2")
+        tracker_state.assign("Kate2", "Project A")
+        assert tracker_state.done("Kate2") is True
 
     def test_returns_false_when_idle(self):
         tracker_state.add("Liam")
@@ -139,24 +146,40 @@ class TestDone:
     def test_returns_false_for_missing_instance(self):
         assert tracker_state.done("Nobody") is False
 
-    def test_clears_current_project(self):
+    def test_removes_from_active(self):
         tracker_state.add("Mia")
         tracker_state.assign("Mia", "Project A")
-        tracker_state.done("Mia")
+        pid = tracker_state.load()["instances"]["Mia"]["active"][0]["id"]
+        tracker_state.done("Mia", pid)
         inst = tracker_state.load()["instances"]["Mia"]
-        assert inst["current_project"] is None
-        assert inst["notes"] == ""
-        assert inst["assigned_at"] is None
+        assert inst["active"] == []
+
+    def test_only_removes_specified_project(self):
+        tracker_state.add("Mia2")
+        tracker_state.assign("Mia2", "Project A")
+        tracker_state.assign("Mia2", "Project B")
+        active = tracker_state.load()["instances"]["Mia2"]["active"]
+        pid_a = next(e["id"] for e in active if e["project"] == "Project A")
+        tracker_state.done("Mia2", pid_a)
+        inst = tracker_state.load()["instances"]["Mia2"]
+        assert len(inst["active"]) == 1
+        assert inst["active"][0]["project"] == "Project B"
 
     def test_completed_project_in_history(self):
         tracker_state.add("Noah")
         tracker_state.assign("Noah", "Project A", "notes here")
-        tracker_state.done("Noah")
+        pid = tracker_state.load()["instances"]["Noah"]["active"][0]["id"]
+        tracker_state.done("Noah", pid)
         history = tracker_state.load()["instances"]["Noah"]["history"]
         assert len(history) == 1
         assert history[0]["project"] == "Project A"
         assert history[0]["notes"] == "notes here"
         assert history[0]["completed_at"] is not None
+
+    def test_returns_false_for_wrong_project_id(self):
+        tracker_state.add("Pat")
+        tracker_state.assign("Pat", "Project A")
+        assert tracker_state.done("Pat", project_id=99999) is False
 
 
 # ── history cap ────────────────────────────────────────────────────────────────
@@ -167,6 +190,9 @@ class TestHistoryCap:
         tracker_state.add("Oscar")
         for i in range(5):
             tracker_state.assign("Oscar", f"Project {i}")
+        # Mark all 5 done (oldest first via no project_id)
+        for _ in range(5):
+            tracker_state.done("Oscar")
         history = tracker_state.load()["instances"]["Oscar"]["history"]
         assert len(history) == 3
 
@@ -175,7 +201,9 @@ class TestHistoryCap:
         tracker_state.add("Pam")
         for i in range(4):
             tracker_state.assign("Pam", f"Project {i}")
-        # Projects 0–2 went to history; cap=2 keeps only the 2 most recent (1 and 2).
+        for _ in range(4):
+            tracker_state.done("Pam")
+        # cap=2 keeps only the 2 most recent
         history = tracker_state.load()["instances"]["Pam"]["history"]
         projects = [h["project"] for h in history]
         assert "Project 0" not in projects
@@ -199,9 +227,10 @@ class TestLoad:
         tracker_state.add("Sam")
         tracker_state.assign("Sam", "My Project", "context")
         inst = tracker_state.load()["instances"]["Sam"]
-        assert inst["current_project"] == "My Project"
-        assert inst["notes"] == "context"
-        assert inst["assigned_at"] is not None
+        assert len(inst["active"]) == 1
+        assert inst["active"][0]["project"] == "My Project"
+        assert inst["active"][0]["notes"] == "context"
+        assert inst["active"][0]["assigned_at"] is not None
         assert inst["history"] == []
 
     def test_instances_ordered_by_name(self):

@@ -101,9 +101,28 @@ def _db():
             assigned_at   TEXT,
             completed_at  TEXT
         );
+        CREATE TABLE IF NOT EXISTS active_projects (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            instance_name TEXT NOT NULL
+                          REFERENCES instances(name) ON DELETE CASCADE,
+            project       TEXT NOT NULL,
+            notes         TEXT NOT NULL DEFAULT '',
+            assigned_at   TEXT
+        );
     """)
     # Must be set per-connection after DDL so FK enforcement is active for DML.
     con.execute("PRAGMA foreign_keys=ON")
+    # Migrate legacy single-project columns into active_projects (one-time, idempotent).
+    with con:
+        con.execute("""
+            INSERT INTO active_projects (instance_name, project, notes, assigned_at)
+            SELECT name, current_project, COALESCE(notes, ''), assigned_at
+            FROM instances WHERE current_project IS NOT NULL
+        """)
+        con.execute("""
+            UPDATE instances SET current_project = NULL, notes = '', assigned_at = NULL
+            WHERE current_project IS NOT NULL
+        """)
     try:
         yield con
         con.commit()
@@ -127,26 +146,25 @@ def _trim_history(con: sqlite3.Connection, name: str) -> None:
 def load() -> dict:
     with _db() as con:
         instances: dict = {}
-        for name, current_project, notes, assigned_at in con.execute(
-            "SELECT name, current_project, notes, assigned_at FROM instances ORDER BY name"
-        ):
-            rows = con.execute(
+        for (name,) in con.execute("SELECT name FROM instances ORDER BY name"):
+            active_rows = con.execute(
+                "SELECT id, project, notes, assigned_at FROM active_projects "
+                "WHERE instance_name = ? ORDER BY assigned_at",
+                (name,),
+            ).fetchall()
+            history_rows = con.execute(
                 "SELECT project, notes, assigned_at, completed_at FROM history "
                 "WHERE instance_name = ? ORDER BY id",
                 (name,),
             ).fetchall()
             instances[name] = {
-                "current_project": current_project,
-                "notes": notes or "",
-                "assigned_at": assigned_at,
+                "active": [
+                    {"id": r[0], "project": r[1], "notes": r[2] or "", "assigned_at": r[3]}
+                    for r in active_rows
+                ],
                 "history": [
-                    {
-                        "project": r[0],
-                        "notes": r[1] or "",
-                        "assigned_at": r[2],
-                        "completed_at": r[3],
-                    }
-                    for r in rows
+                    {"project": r[0], "notes": r[1] or "", "assigned_at": r[2], "completed_at": r[3]}
+                    for r in history_rows
                 ],
             }
         return {"instances": instances}
@@ -184,57 +202,52 @@ def exists(name: str) -> bool:
 
 
 def assign(name: str, project: str, notes: str = "") -> bool:
-    """Assign project to instance. Creates the instance if it doesn't exist.
+    """Add a project to an instance. Creates the instance if it doesn't exist.
     Returns True if the instance was newly created, False if it already existed."""
     _validate(name=name, project=project, notes=notes)
     with _db() as con:
-        row = con.execute(
-            "SELECT current_project, notes, assigned_at FROM instances WHERE name = ?",
-            (name,),
-        ).fetchone()
-        if row is None:
-            con.execute(
-                "INSERT INTO instances (name, current_project, notes, assigned_at) "
-                "VALUES (?, ?, ?, ?)",
-                (name, project, notes, _now()),
-            )
-            return True
-        if row[0]:
-            con.execute(
-                "INSERT INTO history "
-                "(instance_name, project, notes, assigned_at, completed_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (name, row[0], row[1], row[2], _now()),
-            )
-            _trim_history(con, name)
+        exists_row = con.execute("SELECT 1 FROM instances WHERE name = ?", (name,)).fetchone()
+        if exists_row is None:
+            con.execute("INSERT INTO instances (name) VALUES (?)", (name,))
+            created = True
+        else:
+            created = False
         con.execute(
-            "UPDATE instances SET current_project = ?, notes = ?, assigned_at = ? "
-            "WHERE name = ?",
-            (project, notes, _now(), name),
+            "INSERT INTO active_projects (instance_name, project, notes, assigned_at) "
+            "VALUES (?, ?, ?, ?)",
+            (name, project, notes, _now()),
         )
-        return False
+        return created
 
 
-def done(name: str) -> bool:
-    """Mark active project done. Returns False if instance is idle or not found."""
+def done(name: str, project_id: int | None = None) -> bool:
+    """Mark an active project done and move it to history.
+
+    If project_id is given, marks that specific row. Otherwise marks the
+    oldest active project. Returns False if no matching project found.
+    """
     _validate(name=name)
     with _db() as con:
-        row = con.execute(
-            "SELECT current_project, notes, assigned_at FROM instances WHERE name = ?",
-            (name,),
-        ).fetchone()
-        if not row or not row[0]:
+        if project_id is not None:
+            row = con.execute(
+                "SELECT id, project, notes, assigned_at FROM active_projects "
+                "WHERE id = ? AND instance_name = ?",
+                (project_id, name),
+            ).fetchone()
+        else:
+            row = con.execute(
+                "SELECT id, project, notes, assigned_at FROM active_projects "
+                "WHERE instance_name = ? ORDER BY assigned_at LIMIT 1",
+                (name,),
+            ).fetchone()
+        if not row:
             return False
+        rid, project, notes, assigned_at = row
         con.execute(
-            "INSERT INTO history "
-            "(instance_name, project, notes, assigned_at, completed_at) "
+            "INSERT INTO history (instance_name, project, notes, assigned_at, completed_at) "
             "VALUES (?, ?, ?, ?, ?)",
-            (name, row[0], row[1], row[2], _now()),
+            (name, project, notes, assigned_at, _now()),
         )
         _trim_history(con, name)
-        con.execute(
-            "UPDATE instances SET current_project = NULL, notes = '', assigned_at = NULL "
-            "WHERE name = ?",
-            (name,),
-        )
+        con.execute("DELETE FROM active_projects WHERE id = ?", (rid,))
         return True

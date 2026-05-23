@@ -48,6 +48,7 @@ InstanceCard {
     border: round $panel-darken-2;
     padding: 1 2;
     background: $surface;
+    overflow-y: auto;
 }
 
 InstanceCard.active {
@@ -131,15 +132,24 @@ AddModal, EditModal, HistoryModal, ConfirmModal {
     text-style: italic;
     padding: 1 2;
 }
+
+.done-choice {
+    width: 1fr;
+    margin-top: 1;
+}
 """
 
 
 def _card_markup(name: str, data: dict) -> str:
-    project = data.get("current_project")
-    notes = data.get("notes", "")
-    assigned_at = data.get("assigned_at")
+    active = data.get("active", [])
     parts = [f"[bold]{escape(name)}[/bold]", ""]
-    if project:
+    if not active:
+        parts.append("[dim]— idle —[/dim]")
+        return "\n".join(parts)
+    for entry in active:
+        project = entry["project"]
+        notes = entry.get("notes", "")
+        assigned_at = entry.get("assigned_at")
         parts.append(f"[green]📁 {escape(project)}[/green]")
         if assigned_at:
             a = tracker_state.age(assigned_at)
@@ -153,25 +163,25 @@ def _card_markup(name: str, data: dict) -> str:
             except Exception:
                 parts.append(f"[dim]⏱  {a}[/dim]")
         if notes:
-            parts += ["", f"[dim italic]{escape(notes)}[/dim italic]"]
-    else:
-        parts.append("[dim]— idle —[/dim]")
-    return "\n".join(parts)
+            parts.append(f"[dim italic]{escape(notes)}[/dim italic]")
+        parts.append("")
+    return "\n".join(parts).rstrip()
 
 
 def _card_classes(data: dict) -> list[str]:
-    project = data.get("current_project")
-    if not project:
+    active = data.get("active", [])
+    if not active:
         return []
-    assigned_at = data.get("assigned_at")
-    try:
-        t = datetime.fromisoformat(assigned_at)
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
-        if (datetime.now(timezone.utc) - t) > timedelta(hours=8):
-            return ["overdue"]
-    except Exception:
-        pass
+    for entry in active:
+        assigned_at = entry.get("assigned_at")
+        try:
+            t = datetime.fromisoformat(assigned_at)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - t) > timedelta(hours=8):
+                return ["overdue"]
+        except Exception:
+            pass
     return ["active"]
 
 
@@ -231,27 +241,22 @@ class AddModal(ModalScreen):
         self.do_ok()
 
 
-class EditModal(ModalScreen):
+class AssignModal(ModalScreen):
     BINDINGS = [Binding("escape", "dismiss", "Cancel")]
 
-    def __init__(self, name: str, data: dict, **kwargs):
+    def __init__(self, name: str, **kwargs):
         super().__init__(**kwargs)
         self._name = name
-        self._data = data
 
     def compose(self) -> ComposeResult:
-        project = self._data.get("current_project", "")
-        notes = self._data.get("notes", "")
         with Vertical(classes="dialog"):
-            yield Label(f"Assign: {self._name}", classes="dialog-title")
+            yield Label(f"Add project: {self._name}", classes="dialog-title")
             yield Label("Project:", classes="dialog-label")
-            yield Input(value=project, placeholder="e.g. Auth service refactor", id="proj-in")
+            yield Input(placeholder="e.g. Auth service refactor", id="proj-in")
             yield Label("Notes (optional):", classes="dialog-label")
-            yield Input(value=notes, placeholder="Brief context...", id="notes-in")
+            yield Input(placeholder="Brief context...", id="notes-in")
             with Horizontal(classes="dialog-buttons"):
-                yield Button("Save", variant="primary", id="save")
-                if project:
-                    yield Button("Mark done ✓", variant="success", id="done")
+                yield Button("Add", variant="primary", id="save")
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
@@ -261,11 +266,7 @@ class EditModal(ModalScreen):
     def do_save(self) -> None:
         proj = self.query_one("#proj-in", Input).value.strip()
         notes = self.query_one("#notes-in", Input).value.strip()
-        self.dismiss({"action": "assign", "project": proj, "notes": notes} if proj else None)
-
-    @on(Button.Pressed, "#done")
-    def do_done(self) -> None:
-        self.dismiss({"action": "done"})
+        self.dismiss({"project": proj, "notes": notes} if proj else None)
 
     @on(Button.Pressed, "#cancel")
     def do_cancel(self) -> None:
@@ -278,6 +279,39 @@ class EditModal(ModalScreen):
     @on(Input.Submitted, "#notes-in")
     def notes_submitted(self) -> None:
         self.do_save()
+
+
+class DoneSelectModal(ModalScreen):
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, name: str, active: list[dict], **kwargs):
+        super().__init__(**kwargs)
+        self._name = name
+        self._active = active
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(f"Mark done: {self._name}", classes="dialog-title")
+            yield Label("Select project to complete:", classes="dialog-label")
+            for entry in self._active:
+                age = tracker_state.age(entry["assigned_at"])
+                label = f"{escape(entry['project'])}  [dim]({age})[/dim]"
+                yield Button(label, id=f"proj-{entry['id']}", classes="done-choice")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        buttons = list(self.query(".done-choice"))
+        if buttons:
+            buttons[0].focus()
+
+    @on(Button.Pressed)
+    def on_button(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        elif event.button.id and event.button.id.startswith("proj-"):
+            project_id = int(event.button.id.removeprefix("proj-"))
+            self.dismiss(project_id)
 
 
 class HistoryModal(ModalScreen):
@@ -355,8 +389,8 @@ class TrackerApp(App):
     TITLE = "Instance Tracker"
     BINDINGS = [
         Binding("n", "new_instance", "New"),
-        Binding("e", "edit", "Assign/Edit"),
-        Binding("enter", "edit", "Assign/Edit", show=False),
+        Binding("e", "edit", "Assign"),
+        Binding("enter", "edit", "Assign", show=False),
         Binding("h", "history", "History"),
         Binding("d", "mark_done", "Done"),
         Binding("delete", "remove_instance", "Remove", show=False),
@@ -458,39 +492,44 @@ class TrackerApp(App):
         if card is None:
             self.notify("Select an instance card first", severity="warning")
             return
-        state = tracker_state.load()
-        data = state["instances"].get(card.instance_name, {})
         name = card.instance_name
 
         def cb(result: dict | None) -> None:
             if result is None:
                 return
             try:
-                if result["action"] == "assign":
-                    tracker_state.assign(name, result["project"], result["notes"])
-                    self.notify(f"{name} → {result['project']}")
-                elif result["action"] == "done":
-                    if tracker_state.done(name):
-                        self.notify(f"{name} ✓ done")
+                tracker_state.assign(name, result["project"], result["notes"])
+                self.notify(f"{name} → {result['project']}")
             except ValueError as e:
                 self.notify(str(e), severity="error")
             self._schedule_rebuild(prefer=name)
 
-        self.push_screen(EditModal(name, data), cb)
+        self.push_screen(AssignModal(name), cb)
 
     def action_mark_done(self) -> None:
         card = self._focused_card()
         if card is None:
             return
-        if not card.instance_data.get("current_project"):
-            self.notify("No active project", severity="warning")
-            return
+        active = card.instance_data.get("active", [])
         name = card.instance_name
-        if not tracker_state.done(name):
+        if not active:
             self.notify("No active project", severity="warning")
             return
-        self._schedule_rebuild(prefer=name)
-        self.notify(f"{name} ✓ done")
+
+        def _do_done(project_id: int) -> None:
+            if not tracker_state.done(name, project_id):
+                self.notify("Project not found", severity="warning")
+                return
+            self._schedule_rebuild(prefer=name)
+            self.notify(f"{name} ✓ done")
+
+        if len(active) == 1:
+            _do_done(active[0]["id"])
+        else:
+            def cb(project_id: int | None) -> None:
+                if project_id is not None:
+                    _do_done(project_id)
+            self.push_screen(DoneSelectModal(name, active), cb)
 
     def action_history(self) -> None:
         card = self._focused_card()
@@ -548,13 +587,18 @@ def cmd_status() -> None:
     table.add_column("Since")
     table.add_column("Notes", style="dim")
     for name, data in instances.items():
-        project = data.get("current_project")
-        assigned_at = data.get("assigned_at")
-        notes = data.get("notes", "")
-        if project:
-            table.add_row(name, f"[green]{escape(project)}[/]", tracker_state.age(assigned_at), notes)
-        else:
+        active = data.get("active", [])
+        if not active:
             table.add_row(name, "[dim]idle[/]", "", "")
+        else:
+            for i, entry in enumerate(active):
+                row_name = name if i == 0 else ""
+                table.add_row(
+                    row_name,
+                    f"[green]{escape(entry['project'])}[/]",
+                    tracker_state.age(entry["assigned_at"]),
+                    entry.get("notes", ""),
+                )
     console.print(table)
 
 
@@ -590,11 +634,30 @@ def cmd_assign(
 
 
 @cli.command("done")
-def cmd_done(name: str = typer.Argument(..., help="Instance name")) -> None:
-    """Mark an instance's current project as done."""
-    if not tracker_state.done(name):
+def cmd_done(
+    name: str = typer.Argument(..., help="Instance name"),
+    project: str = typer.Option("", "--project", "-p", help="Project name (required if multiple active)"),
+) -> None:
+    """Mark an active project as done."""
+    state = tracker_state.load()
+    active = state.get("instances", {}).get(name, {}).get("active", [])
+    if not active:
         console.print(f"[yellow]'{name}' has no active project[/]")
         raise typer.Exit(1)
+    if project:
+        matches = [e for e in active if e["project"] == project]
+        if not matches:
+            console.print(f"[red]No active project named '{project}' for '{name}'[/]")
+            raise typer.Exit(1)
+        project_id = matches[0]["id"]
+    elif len(active) == 1:
+        project_id = active[0]["id"]
+    else:
+        console.print(f"[yellow]'{name}' has multiple active projects. Use --project to specify:[/]")
+        for e in active:
+            console.print(f"  • {escape(e['project'])}")
+        raise typer.Exit(1)
+    tracker_state.done(name, project_id)
     console.print(f"[green]✓[/] {name} marked done")
 
 
