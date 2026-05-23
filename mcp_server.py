@@ -57,9 +57,9 @@ TOOLS = [
     {
         "name": "tracker_assign",
         "description": (
-            "Assign a project to a named Claude instance. "
+            "Add a project to a named Claude instance. "
             "Creates the instance if it doesn't exist yet. "
-            "Moves any existing project to history automatically."
+            "Multiple projects can be active simultaneously."
         ),
         "inputSchema": {
             "type": "object",
@@ -86,8 +86,9 @@ TOOLS = [
     {
         "name": "tracker_done",
         "description": (
-            "Mark a Claude instance's current project as done and return it to idle. "
-            "The completed entry moves to that instance's history."
+            "Mark an active project as done for a Claude instance. "
+            "The completed entry moves to history. "
+            "If the instance has multiple active projects, 'project' is required to identify which one."
         ),
         "inputSchema": {
             "type": "object",
@@ -96,6 +97,11 @@ TOOLS = [
                     "type": "string",
                     "description": "The instance name / character label",
                     "maxLength": tracker_state.MAX_NAME_LEN,
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Project name to mark done. Required when the instance has multiple active projects.",
+                    "maxLength": tracker_state.MAX_PROJECT_LEN,
                 },
             },
             "required": ["instance"],
@@ -142,10 +148,15 @@ def handle_status(_args: dict) -> str:
     lines.append(f"{'INSTANCE':<20} {'PROJECT':<30} {'SINCE':<8} NOTES")
     lines.append("-" * 72)
     for name, data in instances.items():
-        project = data.get("current_project") or "idle"
-        since = tracker_state.age(data.get("assigned_at")) if data.get("current_project") else ""
-        notes = data.get("notes", "")
-        lines.append(f"{name:<20} {project:<30} {since:<8} {notes}")
+        active = data.get("active", [])
+        if not active:
+            lines.append(f"{name:<20} {'idle':<30} {'':<8}")
+        else:
+            for i, entry in enumerate(active):
+                row_name = name if i == 0 else ""
+                since = tracker_state.age(entry.get("assigned_at"))
+                notes = entry.get("notes", "")
+                lines.append(f"{row_name:<20} {entry['project']:<30} {since:<8} {notes}")
     return "\n".join(lines)
 
 
@@ -162,12 +173,26 @@ def handle_assign(args: dict) -> str:
 
 def handle_done(args: dict) -> str:
     name = args.get("instance", "").strip()
+    project = args.get("project", "").strip()
     if not name:
         raise ValueError("instance name required.")
-    _validate_lengths(instance=name)
-    if tracker_state.done(name):
-        return f"✓ {name} marked done"
-    raise ValueError(f"'{name}' has no active project.")
+    _validate_lengths(instance=name, project=project)
+    state = tracker_state.load()
+    active = state.get("instances", {}).get(name, {}).get("active", [])
+    if not active:
+        raise ValueError(f"'{name}' has no active project.")
+    if project:
+        matches = [e for e in active if e["project"] == project]
+        if not matches:
+            raise ValueError(f"No active project named '{project}' for '{name}'.")
+        project_id = matches[0]["id"]
+    elif len(active) == 1:
+        project_id = active[0]["id"]
+    else:
+        names = ", ".join(f"'{e['project']}'" for e in active)
+        raise ValueError(f"'{name}' has multiple active projects: {names}. Specify 'project'.")
+    tracker_state.done(name, project_id)
+    return f"✓ {name} → {project or active[0]['project']} marked done"
 
 
 def handle_add(args: dict) -> str:
