@@ -185,14 +185,21 @@ def handle_done(args: dict) -> str:
         matches = [e for e in active if e["project"] == project]
         if not matches:
             raise ValueError(f"No active project named '{project}' for '{name}'.")
+        if len(matches) > 1:
+            raise ValueError(
+                f"'{name}' has {len(matches)} active projects both named '{project}'. "
+                "This is ambiguous — mark one done from the TUI instead."
+            )
         project_id = matches[0]["id"]
     elif len(active) == 1:
         project_id = active[0]["id"]
     else:
         names = ", ".join(f"'{e['project']}'" for e in active)
         raise ValueError(f"'{name}' has multiple active projects: {names}. Specify 'project'.")
-    tracker_state.done(name, project_id)
-    return f"✓ {name} → {project or active[0]['project']} marked done"
+    completed_name = next(e["project"] for e in active if e["id"] == project_id)
+    if not tracker_state.done(name, project_id):
+        raise ValueError(f"Project '{completed_name}' for '{name}' was already completed.")
+    return f"✓ {name} → {completed_name} marked done"
 
 
 def handle_add(args: dict) -> str:
